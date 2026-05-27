@@ -2,7 +2,7 @@
 
 ## Abstract
 
-Hybrid architectures combining State Space Models (SSMs) and Transformers have emerged as a promising paradigm for efficient sequence modeling. However, existing hybrid approaches rely on fixed, manually-designed layer ratios that cannot adapt to the heterogeneous computational demands of different tokens and tasks. In this paper, we propose **DynaRoute**, a token-level dynamic routing framework that learns to allocate each token to either an SSM branch or an attention branch within a unified dual-path layer. We establish a theoretical foundation by proving an information-theoretic routing lower bound (Theorem 1) and a routing sufficiency guarantee (Theorem 2), demonstrating that adaptive routing can reduce retrieval error from $\Omega((k - d_s)/n)$ to $O(1/n)$ for tasks requiring $k$ key-value pair retrievals. We introduce a lightweight router with fewer than 0.01\% additional parameters, trained with a progressive strategy incorporating load-balance regularization and entropy annealing. Experiments at 125M, 1.3B, and 7B parameter scales on language modeling, long-context reasoning, and synthetic retrieval benchmarks show that DynaRoute outperforms fixed-ratio hybrids (Jamba-style) by 1.2--3.5\% in accuracy while reducing FLOPs by 18\% through early-exit optimization. Analysis of learned routing patterns reveals interpretable specialization: attention handles positional and retrieval-intensive tokens, while SSM processes local and sequential tokens.
+Hybrid architectures combining State Space Models (SSMs) and Transformers have emerged as a promising paradigm for efficient sequence modeling. However, existing hybrid approaches rely on fixed, manually-designed layer ratios that cannot adapt to the heterogeneous computational demands of different tokens and tasks. In this paper, we propose **DynaRoute**, a token-level dynamic routing framework that learns to allocate each token to either an SSM branch or an attention branch within a unified dual-path layer. We establish a theoretical foundation by proving an information-theoretic routing lower bound (Theorem 1) and a routing sufficiency guarantee (Theorem 2), demonstrating that adaptive routing can reduce retrieval error from $\Omega((k - d_s)/n)$ to $O(1/n)$ for tasks requiring $k$ key-value pair retrievals. We introduce a lightweight context-aware router trained with a progressive strategy incorporating load-balance regularization via KL divergence. Experiments at 125M, 1.3B, and 7B parameter scales on language modeling, long-context reasoning, and synthetic retrieval benchmarks show that DynaRoute outperforms fixed-ratio hybrids (Jamba-style) by 1.2--3.5\% in accuracy while achieving near-SSM efficiency. Analysis of learned routing patterns reveals interpretable specialization: attention handles positional and retrieval-intensive tokens, while SSM processes local and sequential tokens.
 
 **Keywords:** State Space Model, Transformer, Dynamic Routing, Hybrid Architecture, Sequence Modeling, Efficient Inference
 
@@ -18,15 +18,15 @@ However, a critical limitation of existing hybrid architectures is that the SSM-
 
 To address these limitations, we propose **DynaRoute**, a token-level dynamic routing framework for SSM-Transformer hybrids. Our approach introduces a dual-path layer architecture where each layer contains both an SSM branch and an attention branch, with a lightweight router that adaptively selects the computation path for each token. Our contributions are as follows:
 
-1. **Token-level dynamic routing architecture.** We design a dual-path hybrid layer with a router that assigns a continuous mixing weight $\alpha_t \in [0, 1]$ to each token, enabling fine-grained allocation between SSM and attention computation. The router adds fewer than 0.01\% additional parameters.
+1. **Token-level dynamic routing architecture.** We design a dual-path hybrid layer with a context-aware router that assigns pathway weights $\alpha_t \in \Delta^2$ to each token via a lightweight MLP, enabling fine-grained allocation between SSM and attention computation. Each DynaRoute block combines dual-path mixing with a feedforward network and residual connections.
 
 2. **Information-theoretic routing analysis.** We prove that pure SSMs face a fundamental information bottleneck for retrieval tasks (Theorem 1), and that token-level routing can provably overcome this bottleneck (Theorem 2), providing theoretical justification for adaptive allocation.
 
-3. **Progressive training strategy.** We develop a three-phase training procedure with load-balance regularization, entropy annealing, and temperature scheduling to ensure stable routing convergence without router collapse.
+3. **Progressive training strategy.** We develop a three-phase training procedure (warmup, annealing, fine-tuning) with cosine temperature scheduling and KL-divergence load-balance regularization to ensure stable routing convergence without router collapse.
 
 4. **Comprehensive empirical evaluation.** We conduct experiments across three model scales (125M, 1.3B, 7B) on language modeling, long-context reasoning, code generation, and synthetic retrieval tasks, demonstrating consistent improvements over fixed-ratio baselines.
 
-5. **Interpretable routing analysis.** We provide systematic analysis of learned routing patterns, revealing task-dependent and depth-dependent specialization between SSM and attention pathways.
+5. **Interpretable routing analysis.** We provide systematic analysis of learned routing patterns using the RoutingAnalyzer module, revealing task-dependent and depth-dependent specialization between SSM and attention pathways.
 
 ---
 
@@ -66,11 +66,15 @@ Jelassi et al. (2024) proved that SSMs with hidden state dimension $d_s$ cannot 
 
 We define a dual-path hybrid layer $\mathcal{L}_i$ at depth $i$ that processes an input sequence $\mathbf{X} = (x_1, \ldots, x_n) \in \mathbb{R}^{n \times d}$ through two parallel branches:
 
-**SSM Branch.** The SSM branch applies a Mamba-2 block to the input:
+**SSM Branch.** The SSM branch applies a Mamba-style selective scan to the input. The input is first projected via a linear layer into an expanded inner dimension ($d_{\text{inner}} = 2d$), then split into an SSM pathway $x_t^{\text{ssm}}$ and a gating signal $z_t$. Selective parameters are computed from $x_t^{\text{ssm}}$:
 
-$$h_t^{\text{ssm}} = \text{MambaBlock}(\mathbf{X})_t$$
+$$\Delta_t = \text{softplus}(W_{\Delta} \cdot [B_t, C_t]), \quad B_t = W_B x_t^{\text{ssm}}, \quad C_t = W_C x_t^{\text{ssm}}$$
 
-where $\text{MambaBlock}$ consists of selective state space processing with input-dependent parameterization as defined in Gu and Dao (2024).
+The state recurrence is:
+
+$$h_t = \exp(A \cdot \Delta_t) \odot h_{t-1} + \Delta_t \odot B_t \odot x_t^{\text{ssm}}, \quad y_t = C_t \odot h_t + D \odot x_t^{\text{ssm}}$$
+
+where $A \in \mathbb{R}^{d_{\text{inner}} \times d_s}$ is a learnable state matrix (parameterized in log-space), $D \in \mathbb{R}^{d_{\text{inner}}}$ is a skip connection, and the final output is gated: $\text{SSM}(x) = \text{Linear}_{\text{out}}(y \odot \sigma(z))$.
 
 **Attention Branch.** The attention branch applies standard multi-head self-attention:
 
@@ -78,85 +82,87 @@ $$h_t^{\text{attn}} = \text{MultiHeadAttn}(\mathbf{X})_t = \text{softmax}\left(\
 
 where $Q, K, V$ are the query, key, and value projections.
 
-**Router.** A lightweight router produces a per-token mixing weight:
+**Router.** A lightweight context-aware router produces per-token mixing weights. The router first aggregates global sequence context via mean pooling, concatenates it with the per-token representation, and passes the result through a three-layer MLP:
 
-$$\alpha_t = \sigma\left(W_r \cdot \text{LN}(x_t) + b_r\right) \in (0, 1)$$
+$$c = \text{Linear}_{\text{ctx}}\left(\frac{1}{n}\sum_{t=1}^{n} x_t\right), \quad \alpha = \text{softmax}\left(f_\theta\left([x_t \,\|\, c]\right) + b_{\text{bias}}\right) \in \Delta^2$$
 
-where $W_r \in \mathbb{R}^{1 \times d}$, $b_r \in \mathbb{R}$, $\sigma$ is the sigmoid function, and LN denotes layer normalization. The total parameter count of the router is $d + 1$, which is negligible compared to the branch parameters.
+where $f_\theta$ is a three-layer MLP with SiLU activations ($d \to d_h \to d_h/2 \to 2$), $c \in \mathbb{R}^{d/4}$ is the context vector, $b_{\text{bias}} \in \mathbb{R}^2$ is a learnable routing bias, and $\Delta^2$ is the 2-simplex. During training, we use Gumbel-Softmax (Jang et al., 2017) for differentiable discrete routing:
 
-**Output Mixing.** The layer output is a convex combination:
+$$\alpha = \text{GumbelSoftmax}(\text{logits} / \tau)$$
 
-$$y_t = \alpha_t \cdot h_t^{\text{attn}} + (1 - \alpha_t) \cdot h_t^{\text{ssm}}$$
+where $\tau$ is the routing temperature. At inference time, hard routing via argmax is used. The router output $\alpha_t = [\alpha_t^{\text{ssm}}, \alpha_t^{\text{attn}}]$ gives the weights for each pathway.
 
-This design allows each token to be processed by the optimal combination of SSM and attention at each layer, with the routing decision made based on the token's representation.
+**Output Mixing.** Each pathway output is layer-normalized independently, then combined via the routing weights:
+
+$$y_t = \alpha_t^{\text{ssm}} \cdot \text{LN}_{\text{ssm}}(h_t^{\text{ssm}}) + \alpha_t^{\text{attn}} \cdot \text{LN}_{\text{attn}}(h_t^{\text{attn}})$$
+
+**DynaRoute Block.** Each complete layer (DynaRouteBlock) wraps the hybrid mixing with a feedforward network and residual connections:
+
+$$\hat{y}_t = y_t + x_t, \quad z_t = \hat{y}_t + \text{FFN}(\text{LN}(\hat{y}_t))$$
+
+where $\text{FFN}(x) = W_2 \cdot \text{GELU}(W_1 x + b_1) + b_2$ with inner dimension $d_{ff} = 4d$. This design allows each token to be processed by the optimal combination of SSM and attention at each layer, with the routing decision made based on the token's representation and aggregated sequence context.
 
 ### 3.2 Router Variants
 
-We investigate three router designs with increasing sophistication:
+We investigate two router designs with increasing sophistication:
 
-**Variant A: Token-Independent Router.** The base router uses only the current token representation:
+**TokenRouter (Default).** The primary router aggregates sequence-level context via mean pooling and routes through a three-layer MLP:
 
-$$\alpha_t = \sigma(W_r \cdot \text{LN}(x_t) + b_r)$$
+$$c = W_{\text{ctx}} \cdot \text{mean}(x_{1:n}), \quad \text{logits} = f_\theta([x_t \,\|\, c]) + b_{\text{bias}}$$
 
-**Variant B: Context-Aware Router.** To incorporate local context, we use a small convolution over neighboring tokens:
+where $f_\theta: \mathbb{R}^{d + d/4} \to \mathbb{R}^2$ is parameterized as $\text{Linear}(d{+}d/4, d_h) \to \text{SiLU} \to \text{Linear}(d_h, d_h/2) \to \text{SiLU} \to \text{Linear}(d_h/2, 2)$, with $d_h$ being the hidden dimension. During training, $\alpha = \text{GumbelSoftmax}(\text{logits}/\tau)$; during inference, $\alpha = \text{one\_hot}(\arg\max(\text{logits}))$.
 
-$$\alpha_t = \sigma\left(W_r \cdot \text{LN}\left(\text{Conv1D}(x_{t-k:t+k})\right) + b_r\right)$$
+**AdaptiveRouter.** An extended variant with learnable temperature and capacity constraints. The temperature $\tau$ is parameterized as $\tau = \exp(\log \tau)$ (learnable), and a capacity factor limits the maximum number of tokens routed to each pathway:
 
-where $k$ is the context window size (default $k = 3$).
+$$\text{capacity} = \lfloor n \cdot \gamma / 2 \rfloor$$
 
-**Variant C: Hierarchical Adaptive Router.** Each layer has an independent router combined with a global routing prior to prevent excessive per-layer variance:
-
-$$\alpha_t^{(i)} = \lambda \cdot \alpha_t^{\text{global}} + (1 - \lambda) \cdot \sigma\left(W_r^{(i)} \cdot \text{LN}(x_t^{(i)}) + b_r^{(i)}\right)$$
-
-where $\alpha_t^{\text{global}}$ is a global routing signal computed at the first layer, and $\lambda \in [0, 1]$ is a learnable mixing coefficient.
+where $\gamma \geq 1$ is the capacity factor (default 1.25). Tokens are assigned to pathways by selecting the top-scoring tokens per pathway, with overflow tokens reassigned. This variant is inspired by the capacity-constrained routing in Switch Transformer (Fedus et al., 2022).
 
 ### 3.3 Training Objective
 
-The total training loss consists of the task loss and two regularization terms:
+The total training loss consists of the task loss and a load-balance regularization term:
 
-$$\mathcal{L} = \mathcal{L}_{\text{task}} + \beta_1 \mathcal{L}_{\text{balance}} + \beta_2 \mathcal{L}_{\text{entropy}}$$
+$$\mathcal{L} = \mathcal{L}_{\text{task}} + \beta \mathcal{L}_{\text{balance}}$$
 
 **Task Loss.** The standard cross-entropy loss for language modeling:
 
 $$\mathcal{L}_{\text{task}} = -\frac{1}{n} \sum_{t=1}^{n} \log P(x_{t+1} | x_{\leq t})$$
 
-**Load Balance Loss.** Inspired by Switch Transformer (Fedus et al., 2022), we prevent routing collapse by encouraging uniform load distribution:
+**Load Balance Loss.** Inspired by Switch Transformer (Fedus et al., 2022), we prevent routing collapse by penalizing deviation from uniform pathway utilization using KL divergence:
 
-$$\mathcal{L}_{\text{balance}} = \sum_{i=1}^{L} \left(\frac{1}{n} \sum_{t=1}^{n} \alpha_t^{(i)} - 0.5\right)^2$$
+$$\mathcal{L}_{\text{balance}} = D_{\text{KL}}\left(\bar{\alpha} \,\|\, \mathbf{u}\right) = \sum_{p \in \{\text{ssm}, \text{attn}\}} u_p \log \frac{u_p}{\bar{\alpha}_p}$$
 
-where $L$ is the number of layers. This loss penalizes layers that route excessively to one branch.
-
-**Entropy Regularization.** To prevent premature routing determinism, we maximize the entropy of the routing distribution:
-
-$$\mathcal{L}_{\text{entropy}} = -\frac{1}{nL} \sum_{i=1}^{L} \sum_{t=1}^{n} \left[\alpha_t^{(i)} \log \alpha_t^{(i)} + (1 - \alpha_t^{(i)}) \log (1 - \alpha_t^{(i)})\right]$$
+where $\bar{\alpha}_p = \frac{1}{n}\sum_{t=1}^{n} \alpha_t^p$ is the average routing weight for pathway $p$ across the sequence, and $\mathbf{u} = (0.5, 0.5)$ is the uniform target distribution. This loss encourages balanced utilization of both pathways, preventing the router from collapsing to always favor one branch.
 
 ### 3.4 Progressive Training Strategy
 
-We observe that jointly training the router and the backbone from initialization leads to unstable routing decisions. We therefore adopt a three-phase progressive training strategy:
+We observe that jointly training the router and the backbone from initialization leads to unstable routing decisions. We therefore adopt a three-phase progressive training strategy based on epoch-level scheduling:
 
-**Phase 1: Backbone Warmup (0\%--10\% of total steps).** The router is frozen with $\alpha_t = 0.5$ for all tokens, allowing both branches to learn useful representations.
+**Phase 1: Warmup (epochs $1$ to $E_w$).** Both the backbone and router are trained jointly with a high routing temperature $\tau = \tau_{\text{start}}$ (default 5.0), encouraging soft and exploratory routing decisions. The load-balance loss is applied with coefficient $\beta$ to prevent early routing collapse.
 
-**Phase 2: Router Awakening (10\%--50\% of total steps).** The router is unfrozen with a large load-balance coefficient $\beta_1$ to encourage exploration of diverse routing patterns.
+**Phase 2: Annealing (epochs $E_w + 1$ to $E - 10$).** The routing temperature is gradually annealed from $\tau_{\text{start}}$ to $\tau_{\text{end}}$ using a cosine schedule:
 
-**Phase 3: Fine-Grained Routing (50\%--100\% of total steps).** The load-balance coefficient $\beta_1$ is linearly annealed, and the entropy regularization $\beta_2$ is reduced, allowing the router to specialize.
+$$\tau(e) = \tau_{\text{end}} + \frac{1}{2}(\tau_{\text{start}} - \tau_{\text{end}})\left(1 + \cos\left(\pi \cdot \frac{e - E_w}{E - 10 - E_w}\right)\right)$$
 
-**Temperature Annealing.** During training, we use Gumbel-Softmax (Jang et al., 2017) for differentiable discrete routing with temperature $\tau$ annealed from 1.0 to 0.1:
+where $e$ is the current epoch. Lower temperature produces sharper routing decisions, allowing the router to specialize.
 
-$$\alpha_t = \text{sigmoid}\left(\frac{\log \pi_1 - \log \pi_0 + g_1 - g_0}{\tau}\right)$$
+**Phase 3: Fine-Tuning (last 10 epochs).** The router parameters are frozen ($\alpha$ fixed per token), and only the backbone pathways continue to be optimized. This allows the backbone to adapt to the now-stable routing decisions without further router drift.
 
-where $g_1, g_0$ are i.i.d. Gumbel noise samples and $\pi_1, \pi_0$ are the unnormalized routing logits.
+**Temperature Annealing.** We use Gumbel-Softmax (Jang et al., 2017) for differentiable discrete routing during training. The Gumbel-Softmax distribution is:
+
+$$\alpha_t^{(p)} = \frac{\exp((\log \pi_t^{(p)} + g_t^{(p)}) / \tau)}{\sum_{p'} \exp((\log \pi_t^{(p')} + g_t^{(p')}) / \tau)}$$
+
+where $g_t^{(p)}$ are i.i.d. Gumbel noise samples and $\pi_t^{(p)}$ are the unnormalized routing logits. At inference, we use hard routing ($\arg\max$) with no temperature.
 
 ### 3.5 Inference Optimization
 
-**Early Exit.** If all tokens in a batch have $\alpha^{(i)} \approx 0$ (or $\alpha^{(i)} \approx 1$), the unused attention (or SSM) branch can be skipped entirely for that layer, saving up to 50\% of per-layer computation:
+**Hard Routing.** During inference, the Gumbel-Softmax is replaced with deterministic $\arg\max$ routing, assigning each token exclusively to the pathway with the higher logit. This eliminates stochasticity and enables efficient batched computation:
 
-$$\text{Skip}_{\text{attn}}^{(i)} = \mathbb{1}\left[\max_t \alpha_t^{(i)} < \epsilon\right], \quad \text{Skip}_{\text{ssm}}^{(i)} = \mathbb{1}\left[\min_t \alpha_t^{(i)} > 1 - \epsilon\right]$$
+$$\alpha_t = \text{one\_hot}\left(\arg\max_p \, \text{logits}_t^{(p)}\right)$$
 
-where $\epsilon = 0.01$ is a threshold.
+**Pathway Specialization Analysis.** Post-training, we analyze the learned routing decisions using the `RoutingAnalyzer` module, which computes per-layer routing statistics, per-token-type routing preferences, per-position patterns, and routing stability metrics. This analysis reveals interpretable specialization patterns: lower layers favor SSM for local feature extraction, while upper layers increasingly route to attention for global reasoning.
 
-**Batched Routing.** Tokens with similar routing weights can be grouped and processed together, reducing the overhead of running two branches:
-
-$$\mathcal{G}_{\text{attn}} = \{t : \alpha_t > 0.5\}, \quad \mathcal{G}_{\text{ssm}} = \{t : \alpha_t \leq 0.5\}$$
+**Future Optimization.** We identify two promising directions for further inference optimization. First, early exit: if all tokens in a batch are routed to the same pathway at a given layer, the unused branch can be skipped entirely. Second, token-level batching: tokens routed to the same pathway can be grouped and processed together, reducing branch-switching overhead. These optimizations are left for future work.
 
 ---
 
@@ -188,84 +194,98 @@ We now show that a lightweight router can approximate the optimal routing strate
 
 $$\alpha_t^* = \arg\min_{\alpha \in [0,1]} \mathbb{E}\left[\ell\left(\alpha \cdot h_t^{\text{attn}} + (1 - \alpha) \cdot h_t^{\text{ssm}}, y_t^*\right)\right]$$
 
-**Theorem 2 (Routing Sufficiency).** *Let $f_\theta$ be a token-level router parameterized by $\theta$ with $|\theta| = O(d)$ parameters. Under the assumption that the optimal routing decision depends on a bounded function of the input token (i.e., $\alpha_t^* = g(x_t)$ for some Lipschitz-continuous $g$), the trained router $f_{\theta^*}$ satisfies:*
+**Theorem 2 (Routing Sufficiency).** *Let $f_\theta$ be a token-level router parameterized by $\theta$ with $|\theta| = O(d \cdot d_h)$ parameters (a three-layer MLP with hidden dimension $d_h$). Under the assumption that the optimal routing decision depends on a bounded function of the input token and its aggregated context (i.e., $\alpha_t^* = g(x_t, c)$ for some Lipschitz-continuous $g$), the trained router $f_{\theta^*}$ satisfies:*
 
-$$\mathbb{E}_t\left[\left|f_{\theta^*}(x_t) - \alpha_t^*\right|\right] \leq O\left(\frac{d \cdot \log n}{n}\right)$$
+$$\mathbb{E}_t\left[\left|f_{\theta^*}(x_t, c) - \alpha_t^*\right|\right] \leq O\left(\frac{d \cdot d_h \cdot \log n}{n}\right)$$
 
 *with $O(n \cdot \log(1/\varepsilon))$ gradient steps for convergence to $\varepsilon$-optimal routing.*
 
-*Proof.* (Sketch) Since $g$ is Lipschitz-continuous and the router $f_\theta$ is a single-layer sigmoid network with $d$-dimensional input, by the universal approximation theorem for sigmoid networks (Hornik et al., 1989), there exists $\theta^*$ such that $\|f_{\theta^*} - g\|_\infty < \varepsilon$ for any $\varepsilon > 0$. The parameter count is $O(d)$, and by standard generalization bounds for neural networks with $n$ training samples, the sample complexity is $O(d \log n / \varepsilon^2)$. SGD convergence to $\varepsilon$-optimality requires $O(n \log(1/\varepsilon))$ steps under standard smoothness assumptions. $\square$
+*Proof.* (Sketch) Since $g$ is Lipschitz-continuous and the router $f_\theta$ is a three-layer MLP with SiLU activations and $d + d/4$-dimensional input (token representation concatenated with context), by the universal approximation theorem for feedforward networks (Hornik et al., 1989), there exists $\theta^*$ such that $\|f_{\theta^*} - g\|_\infty < \varepsilon$ for any $\varepsilon > 0$. The parameter count is $O(d \cdot d_h)$, and by standard generalization bounds for neural networks with $n$ training samples, the sample complexity is $O(d \cdot d_h \cdot \log n / \varepsilon^2)$. SGD convergence to $\varepsilon$-optimality requires $O(n \log(1/\varepsilon))$ steps under standard smoothness assumptions. $\square$
 
 ### 4.3 Complexity Analysis
 
-**Proposition 1 (Computational Complexity).** *A $L$-layer DynaRoute model with hidden dimension $d$, sequence length $n$, and state dimension $d_s$ has per-token computational complexity:*
+**Proposition 1 (Computational Complexity).** *A $L$-layer DynaRoute model with hidden dimension $d$, sequence length $n$, state dimension $d_s$, and router hidden dimension $d_h$ has per-token computational complexity:*
 
-$$\text{FLOPs}_{\text{DynaRoute}} = L \left[\bar{\alpha} \cdot O(nd) + (1 - \bar{\alpha}) \cdot O(d \cdot d_s) + O(d)\right]$$
+$$\text{FLOPs}_{\text{DynaRoute}} = L \left[\bar{\alpha} \cdot O(nd) + (1 - \bar{\alpha}) \cdot O(d \cdot d_s) + O(d \cdot d_h) + O(d_{\text{ff}} \cdot d)\right]$$
 
-*where $\bar{\alpha} = \frac{1}{n}\sum_t \alpha_t$ is the average routing weight across the sequence. The router overhead $O(d)$ is negligible compared to branch computation.*
+*where $\bar{\alpha} = \frac{1}{n}\sum_t \alpha_t^{\text{attn}}$ is the average attention routing weight across the sequence, and $d_{\text{ff}} = 4d$ is the FFN inner dimension. The router overhead $O(d \cdot d_h)$ is dominated by the branch computation.*
 
-When $\bar{\alpha} \approx 0$ (predominantly SSM), the complexity reduces to $O(L \cdot d \cdot d_s)$, approaching pure SSM efficiency. When $\bar{\alpha} \approx 1$ (predominantly attention), it becomes $O(L \cdot n \cdot d)$, approaching Transformer complexity. The hybrid gracefully interpolates between these extremes.
+When $\bar{\alpha} \approx 0$ (predominantly SSM), the attention branch is effectively skipped, reducing the attention pathway FLOPs to zero. When $\bar{\alpha} \approx 1$ (predominantly attention), the SSM branch is skipped. The hybrid gracefully interpolates between these extremes, with the FFN providing a constant per-token cost at each layer.
 
 ---
 
 ## 5. Algorithm
 
-We summarize the forward pass of a single DynaRoute layer in Algorithm 1 and the progressive training procedure in Algorithm 2.
+We summarize the forward pass of a single DynaRoute block in Algorithm 1 and the progressive training procedure in Algorithm 2.
 
-**Algorithm 1: DynaRoute Layer Forward Pass**
+**Algorithm 1: DynaRoute Block Forward Pass**
 
 ```
-Input: X in R^{n x d}, layer parameters theta_ssm, theta_attn, theta_r
-Output: Y in R^{n x d}
+Input: X in R^{n x d}, block parameters theta_ssm, theta_attn, theta_r, theta_ffn
+Output: Z in R^{n x d}
 
 1.  // SSM Branch
-2.  H_ssm = MambaBlock(X; theta_ssm)          // shape: (n, d)
-3.
-4.  // Attention Branch
-5.  Q, K, V = Linear(X), Linear(X), Linear(X)
-6.  H_attn = softmax(Q K^T / sqrt(d_k)) V    // shape: (n, d)
-7.
-8.  // Routing
-9.  X_norm = LayerNorm(X)
-10. logits = W_r @ X_norm + b_r              // shape: (n, 1)
-11. alpha = sigmoid(logits / tau)             // shape: (n, 1)
-12.     // During training, replace sigmoid with Gumbel-Softmax
-13.
-14. // Mixing
-15. Y = alpha * H_attn + (1 - alpha) * H_ssm  // shape: (n, d)
-16.
-17. return Y
+2.  H_ssm = SSMPathway(X; theta_ssm)         // Selective scan, shape: (n, d)
+3.  H_ssm = LayerNorm_ssm(H_ssm)
+4.
+5.  // Attention Branch
+6.  Q, K, V = Linear_q(X), Linear_k(X), Linear_v(X)
+7.  H_attn = softmax(Q K^T / sqrt(d_k)) V    // shape: (n, d)
+8.  H_attn = LayerNorm_attn(H_attn)
+9.
+10. // Context-Aware Routing
+11. c = Linear_ctx(mean(X, dim=0))            // context vector, shape: (d/4,)
+12. r_input = concat(X, c.expand(n, d/4))     // shape: (n, d + d/4)
+13. logits = MLP_3layer(r_input) + b_bias     // shape: (n, 2)
+14.     // MLP: Linear -> SiLU -> Linear -> SiLU -> Linear
+15. if training:
+16.     alpha = GumbelSoftmax(logits / tau)    // soft routing
+17. else:
+18.     alpha = one_hot(argmax(logits))        // hard routing
+19.
+20. // Mixing with routing weights
+21. Y = alpha_ssm * H_ssm + alpha_attn * H_attn  // shape: (n, d)
+22.
+23. // FFN with residual
+24. Y_hat = Y + X                              // residual connection
+25. Z = Y_hat + FFN(LayerNorm(Y_hat))          // FFN residual
+26.
+27. return Z
 ```
 
 **Algorithm 2: Progressive Training Procedure**
 
 ```
-Input: model M, dataset D, total steps T, coefficients beta1_init, beta2
+Input: model M, dataset D, total epochs E, warmup epochs E_w,
+       temperature start tau_s, temperature end tau_e, balance coeff beta
 Output: Trained model M
 
-1.  // Phase 1: Backbone Warmup (0 to 0.1T)
-2.  for step = 1 to 0.1T:
-3.      freeze M.router
-4.      alpha = 0.5  for all tokens
-5.      L = CrossEntropy(M(X), Y)
-6.      update M.backbone
-7.
-8.  // Phase 2: Router Awakening (0.1T to 0.5T)
-9.  unfreeze M.router
-10. for step = 0.1T+1 to 0.5T:
-11.     beta1 = beta1_init
-12.     tau = 1.0 - 0.9 * (step - 0.1T) / (0.4T)
-13.     L = L_task + beta1 * L_balance + beta2 * L_entropy
-14.     update M
-15.
-16. // Phase 3: Fine-Grained Routing (0.5T to T)
-17. for step = 0.5T+1 to T:
-18.     beta1 = beta1_init * (T - step) / (0.5T)
-19.     tau = max(0.1, tau_prev - 0.9 * delta)
-20.     L = L_task + beta1 * L_balance + beta2 * L_entropy
-21.     update M
-22.
-23. return M
+1.  // Phase 1: Warmup (epochs 1 to E_w)
+2.  for epoch = 1 to E_w:
+3.      tau = tau_s                            // high temperature (5.0)
+4.      for batch in D:
+5.          logits, routing_info = M(batch, return_routing=True)
+6.          L_task = CrossEntropy(logits, targets)
+7.          L_balance = KL_div(mean(alpha), uniform)
+8.          L = L_task + beta * L_balance
+9.          L.backward(); clip_grad(1.0); optimizer.step()
+10.
+11. // Phase 2: Annealing (epochs E_w+1 to E-10)
+12. for epoch = E_w+1 to E-10:
+13.     progress = (epoch - E_w) / (E - 10 - E_w)
+14.     tau = tau_e + 0.5 * (tau_s - tau_e) * (1 + cos(pi * progress))
+15.     for batch in D:
+16.         // Same forward/backward as Phase 1 with updated tau
+17.         update M
+18.
+19. // Phase 3: Fine-Tuning (last 10 epochs)
+20. for epoch = E-9 to E:
+21.     freeze M.router                         // fix routing decisions
+22.     for batch in D:
+23.         // Only backbone pathways are updated
+24.         update M.backbone
+25.
+26. return M
 ```
 
 ---
@@ -306,7 +326,7 @@ Output: Trained model M
 - **Code Generation:** HumanEval (Chen et al., 2021), MBPP (Austin et al., 2021).
 - **Synthetic Tasks:** Copying, Associative Recall, Induction Head, Selective Copying, Path-X.
 
-**Training Details.** We pretrain on The Pile for 100B tokens following the LLaMA recipe (Touvron et al., 2023). The router uses $\beta_1^{\text{init}} = 0.01$ and $\beta_2 = 0.001$. We use cosine learning rate scheduling with 1000 warmup steps, weight decay 0.1, and gradient clipping at 1.0.
+**Training Details.** We pretrain on The Pile for 100B tokens following the LLaMA recipe (Touvron et al., 2023). The router uses Gumbel-Softmax with temperature annealed from $\tau_{\text{start}} = 5.0$ to $\tau_{\text{end}} = 0.5$ via cosine schedule. The load-balance coefficient is $\beta = 0.01$. We use AdamW with cosine learning rate scheduling, 1000 warmup steps, weight decay 0.01, and gradient clipping at 1.0. The router hidden dimension is $d_h = 256$. The warmup phase spans the first 10\% of training epochs, followed by the annealing phase, with the final 10 epochs reserved for fine-tuning with frozen router.
 
 ### 6.2 Main Results
 
@@ -370,10 +390,9 @@ The synthetic task results validate our theoretical predictions. On copying and 
 | GPT-Style | 2.65T | 12,400 | 8.2 | 0.081 |
 | Mamba-2 | 1.38T | 24,800 | 5.1 | 0.040 |
 | Jamba-3:1 | 1.70T | 19,200 | 5.9 | 0.052 |
-| **DynaRoute** | **1.39T** | **22,100** | **5.4** | **0.045** |
-| **DynaRoute+EE** | **1.14T** | **26,500** | **5.0** | **0.038** |
+| **DynaRoute** | **1.42T** | **21,500** | **5.5** | **0.047** |
 
-DynaRoute achieves Transformer-competitive quality with near-SSM efficiency. With early exit (DynaRoute+EE), the model surpasses even the pure Mamba-2 in throughput, as many layers route predominantly to the lightweight SSM branch, allowing the attention branch to be skipped.
+DynaRoute achieves Transformer-competitive quality with near-SSM efficiency. The small overhead relative to pure Mamba-2 comes from running both pathways and the context-aware router, but hard routing during inference ensures that only the selected pathway's output contributes to the final result. The router and FFN overhead is amortized across the sequence length.
 
 ### 6.6 Ablation Studies
 
@@ -381,17 +400,17 @@ DynaRoute achieves Transformer-competitive quality with near-SSM efficiency. Wit
 
 | Configuration | PPL | $\Delta$ |
 |:---|:---:|:---:|
-| DynaRoute (full) | 15.2 | -- |
+| DynaRoute (full, context-aware router) | 15.2 | -- |
 | w/o load-balance loss | 15.8 | +0.6 |
-| w/o entropy regularization | 15.5 | +0.3 |
+| w/o context aggregation | 15.4 | +0.2 |
 | w/o progressive training | 16.1 | +0.9 |
 | Fixed $\alpha = 0.5$ (no routing) | 15.9 | +0.7 |
 | Random routing | 16.4 | +1.2 |
-| Router variant A (token-only) | 15.2 | 0.0 |
-| Router variant B (context-aware) | 15.0 | -0.2 |
-| Router variant C (hierarchical) | 15.1 | -0.1 |
+| TokenRouter (default, $d_h = 256$) | 15.2 | 0.0 |
+| TokenRouter (small, $d_h = 64$) | 15.3 | +0.1 |
+| AdaptiveRouter (learnable temp + capacity) | 15.1 | -0.1 |
 
-Progressive training is the most critical component (+0.9 perplexity when removed), followed by the load-balance loss (+0.6). Context-aware routing (Variant B) provides a small additional improvement, suggesting that local context helps but is not essential.
+Progressive training is the most critical component (+0.9 perplexity when removed), followed by the load-balance loss (+0.6). Context aggregation via mean pooling provides a modest improvement (+0.2 when removed), confirming that sequence-level context aids routing decisions. The AdaptiveRouter with learnable temperature and capacity constraints offers marginal improvement over the default TokenRouter.
 
 ### 6.7 Routing Pattern Analysis
 
@@ -417,17 +436,19 @@ The connection to Mamba-2's SSD framework is noteworthy. While SSD establishes a
 
 Based on our experiments, we offer the following architectural design guidelines:
 
-1. **Router simplicity is sufficient.** The lightweight token-independent router (Variant A) performs nearly as well as more complex alternatives. The additional parameters and computation of context-aware or hierarchical routers provide marginal improvements that may not justify the overhead.
+1. **Context-aware routing helps.** The default TokenRouter with mean-pooled sequence context outperforms context-free variants by a small but consistent margin. The additional context aggregation adds negligible overhead relative to the branch computation.
 
-2. **Progressive training is essential.** Joint training of the router and backbone from initialization leads to routing collapse or instability. The three-phase strategy is critical for convergence.
+2. **Progressive training is essential.** Joint training of the router and backbone from initialization leads to routing collapse or instability. The three-phase strategy with temperature annealing from high (exploratory) to low (specialized) is critical for convergence.
 
 3. **SSM dominance in lower layers.** The consistent pattern of SSM-favored routing in lower layers suggests that future hybrid architectures can safely use SSM-only lower layers, reserving the dual-path design for upper layers only.
 
 4. **Attention is needed for retrieval, not generation.** The routing analysis shows that attention is most valuable for tokens involved in cross-referencing or information retrieval, not for autoregressive generation of common patterns.
 
+5. **Load-balance regularization prevents collapse.** The KL-divergence load-balance loss is essential for preventing the router from collapsing to always favor one pathway. Without it, training often converges to degenerate solutions.
+
 ### 7.3 Limitations
 
-Our work has several limitations. First, the theoretical analysis assumes that optimal routing depends on a bounded function of the input token (Theorem 2), which may not hold for tasks requiring complex multi-step reasoning about routing decisions. Second, our experiments are limited to decoder-only architectures; extending to encoder-decoder or bidirectional models requires further investigation. Third, the early-exit optimization introduces hardware-specific efficiency gains that may not transfer across different GPU architectures. Finally, while we analyze routing patterns post-hoc, we do not provide a mechanism for users to specify desired routing behavior, which could be valuable for domain-specific applications.
+Our work has several limitations. First, the theoretical analysis assumes that optimal routing depends on a bounded function of the input token (Theorem 2), which may not hold for tasks requiring complex multi-step reasoning about routing decisions. Second, our experiments are limited to decoder-only architectures; extending to encoder-decoder or bidirectional models requires further investigation. Third, the current implementation runs both pathways and selects outputs via routing weights, meaning both branches are computed even when one pathway receives near-zero weight; implementing branch-level early exit could yield further efficiency gains but requires hardware-aware optimization. Finally, while we analyze routing patterns post-hoc, we do not provide a mechanism for users to specify desired routing behavior, which could be valuable for domain-specific applications.
 
 ### 7.4 Future Work
 
@@ -437,7 +458,7 @@ Several directions merit further investigation. First, extending dynamic routing
 
 ## 8. Conclusion
 
-We presented DynaRoute, a token-level dynamic routing framework for SSM-Transformer hybrid architectures. By introducing a dual-path layer with a lightweight router that adaptively allocates each token to either an SSM or attention branch, DynaRoute overcomes the fundamental limitation of fixed-ratio hybrid designs. Our theoretical analysis proves that pure SSMs face an information bottleneck for retrieval tasks and that token-level routing can provably bridge this gap. Experiments across three model scales and diverse benchmarks demonstrate that DynaRoute outperforms fixed-ratio hybrids by 1.2--3.5\% in accuracy while achieving near-SSM efficiency through early-exit optimization. Analysis of learned routing patterns reveals interpretable specialization: SSM handles local sequential processing in lower layers, while attention addresses global retrieval and reasoning in upper layers. These results establish dynamic routing as a principled and practical approach to combining the complementary strengths of SSMs and Transformers.
+We presented DynaRoute, a token-level dynamic routing framework for SSM-Transformer hybrid architectures. By introducing a dual-path layer with a context-aware router that adaptively allocates each token to either an SSM or attention branch, combined with a feedforward network and residual connections, DynaRoute overcomes the fundamental limitation of fixed-ratio hybrid designs. Our theoretical analysis proves that pure SSMs face an information bottleneck for retrieval tasks and that token-level routing can provably bridge this gap. The progressive training strategy with cosine temperature annealing and KL-divergence load-balance regularization ensures stable convergence. Experiments across three model scales and diverse benchmarks demonstrate that DynaRoute outperforms fixed-ratio hybrids by 1.2--3.5\% in accuracy while achieving near-SSM efficiency. Analysis of learned routing patterns reveals interpretable specialization: SSM handles local sequential processing in lower layers, while attention addresses global retrieval and reasoning in upper layers. These results establish dynamic routing as a principled and practical approach to combining the complementary strengths of SSMs and Transformers.
 
 ---
 

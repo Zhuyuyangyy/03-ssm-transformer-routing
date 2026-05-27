@@ -163,7 +163,7 @@ def main(args: argparse.Namespace):
             logits = model[2](x)  # Linear head
 
             # Compute loss
-            loss = criterion(logits.view(-1, args.vocab_size), batch_targets.view(-1)
+            loss = criterion(logits.view(-1, args.vocab_size), batch_targets.view(-1))
 
             # Add balance loss
             if routing_info:

@@ -2,12 +2,19 @@
 
 This module implements the routing mechanism that decides whether each token
 should be processed through the SSM pathway or the Attention pathway.
+Two router variants are provided:
+
+- ``TokenRouter``: Standard router with Gumbel-Softmax training and optional
+  context aggregation.
+- ``AdaptiveRouter``: Router with learnable temperature and capacity constraints.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Tuple, Optional
+
+__all__ = ["TokenRouter", "AdaptiveRouter"]
 
 
 class TokenRouter(nn.Module):
@@ -43,11 +50,13 @@ class TokenRouter(nn.Module):
         self.use_context = use_context
 
         # Context aggregation (optional)
+        context_dim = 0
         if use_context:
-            self.context_proj = nn.Linear(d_model, d_model // 4, bias=False)
+            context_dim = d_model // 4
+            self.context_proj = nn.Linear(d_model, context_dim, bias=False)
 
         # Router MLP
-        input_dim = d_model + (d_model // 4 if use_context else 0)
+        input_dim = d_model + context_dim
         self.router = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.SiLU(),
@@ -59,10 +68,21 @@ class TokenRouter(nn.Module):
         # Learnable bias for balanced routing
         self.routing_bias = nn.Parameter(torch.zeros(num_paths))
 
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize router weights with small values for stable early training."""
+        for module in self.router:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
     def _aggregate_context(self, x: torch.Tensor) -> torch.Tensor:
         """Aggregate contextual information from the sequence.
 
-        Uses attention-pooled sequence representation as context.
+        Uses mean-pooled sequence representation as context, broadcast to
+        every position so that each token sees the global picture.
 
         Args:
             x: Input tensor (batch, seq_len, d_model).
@@ -70,7 +90,6 @@ class TokenRouter(nn.Module):
         Returns:
             Context tensor (batch, seq_len, d_model // 4).
         """
-        # Simple mean pooling as context
         context = x.mean(dim=1, keepdim=True)  # (batch, 1, d_model)
         context = context.expand_as(x)  # (batch, seq_len, d_model)
         return self.context_proj(context)
@@ -84,7 +103,7 @@ class TokenRouter(nn.Module):
 
         Args:
             x: Input tensor of shape (batch, seq_len, d_model).
-            hard: Whether to use hard routing. Defaults to self.training.
+            hard: Whether to use hard routing. Defaults to ``not self.training``.
 
         Returns:
             Tuple of:
@@ -111,7 +130,7 @@ class TokenRouter(nn.Module):
         else:
             # Gumbel-Softmax during training
             weights = F.gumbel_softmax(
-                logits, tau=self.temperature, hard=False
+                logits, tau=max(self.temperature, 1e-8), hard=False
             )
 
         return weights, logits
@@ -128,8 +147,8 @@ class TokenRouter(nn.Module):
         Returns:
             Entropy tensor (batch, seq_len).
         """
-        probs = F.softmax(logits, dim=-1)
         log_probs = F.log_softmax(logits, dim=-1)
+        probs = log_probs.exp()
         entropy = -(probs * log_probs).sum(dim=-1)
         return entropy
 
@@ -137,7 +156,7 @@ class TokenRouter(nn.Module):
         """Compute load balancing loss to encourage balanced routing.
 
         Penalizes routing imbalances to prevent one pathway from being
-        underutilized.
+        underutilized. Uses a numerically stable formulation.
 
         Args:
             routing_weights: Routing weights (batch, seq_len, num_paths).
@@ -151,9 +170,11 @@ class TokenRouter(nn.Module):
         # Target: uniform distribution
         target = torch.ones_like(avg_probs) / self.num_paths
 
-        # KL divergence from uniform
+        # KL divergence from uniform (numerically stable via log_softmax)
         loss = F.kl_div(
-            avg_probs.log(), target, reduction="batchmean"
+            F.log_softmax(avg_probs.log(), dim=-1),
+            target,
+            reduction="batchmean",
         )
         return loss
 
@@ -188,7 +209,7 @@ class AdaptiveRouter(nn.Module):
 
         # Learnable temperature
         self.log_temperature = nn.Parameter(
-            torch.tensor(temperature_init).log()
+            torch.tensor(float(temperature_init)).log()
         )
 
         # Router network
@@ -224,9 +245,8 @@ class AdaptiveRouter(nn.Module):
             return self._capacity_routing(logits)
         else:
             # Soft routing
-            weights = F.gumbel_softmax(
-                logits, tau=self.temperature, hard=False
-            )
+            tau = self.temperature.clamp(min=1e-8)
+            weights = F.gumbel_softmax(logits, tau=tau, hard=False)
             return weights, logits
 
     def _capacity_routing(
@@ -243,17 +263,24 @@ class AdaptiveRouter(nn.Module):
         Returns:
             Tuple of (routing_weights, routing_logits).
         """
-        batch, seq_len, _ = logits.shape
-        capacity = int(seq_len * self.capacity_factor / self.num_paths)
+        batch, seq_len, num_paths = logits.shape
+        capacity = max(1, int(seq_len * self.capacity_factor / num_paths))
 
         probs = F.softmax(logits, dim=-1)
 
-        # Get top-k assignments per path
+        # Build hard routing via top-k per path
         weights = torch.zeros_like(probs)
-        for path_idx in range(self.num_paths):
+        path_indicator = torch.eye(
+            num_paths, device=logits.device, dtype=logits.dtype
+        )  # (num_paths, num_paths)
+
+        for path_idx in range(num_paths):
             path_probs = probs[..., path_idx]  # (batch, seq_len)
             _, top_indices = path_probs.topk(capacity, dim=-1)
-            weights.scatter_(1, top_indices.unsqueeze(-1).expand(-1, -1, self.num_paths),
-                           F.one_hot(torch.tensor(path_idx), self.num_paths).float().to(weights.device))
+            # Scatter the one-hot vector for this path at the selected positions
+            # top_indices: (batch, capacity) -> expand for scatter
+            idx_expanded = top_indices.unsqueeze(-1).expand(-1, -1, num_paths)
+            one_hot = path_indicator[path_idx].expand(batch, capacity, -1)
+            weights.scatter_(1, idx_expanded, one_hot)
 
         return weights, logits

@@ -3,6 +3,13 @@
 This module implements the core HybridLayer that routes tokens through either
 an SSM (State Space Model) pathway or a Transformer attention pathway based
 on learned routing decisions.
+
+Key components:
+- ``SSMPathway``: Simplified Mamba-style SSM with selective scan.
+- ``AttentionPathway``: Multi-head self-attention with automatic flash-attention
+  dispatch via ``torch.nn.functional.scaled_dot_product_attention``.
+- ``HybridLayer``: Token-level routing between the two pathways.
+- ``DynaRouteBlock``: Complete block with FFN and residual connections.
 """
 
 import math
@@ -13,11 +20,21 @@ from typing import Optional, Tuple, Dict, Any
 
 from .router import TokenRouter
 
+__all__ = ["SSMPathway", "AttentionPathway", "HybridLayer", "DynaRouteBlock"]
+
 
 class SSMPathway(nn.Module):
     """State Space Model pathway for efficient long-range dependencies.
 
     Implements a simplified Mamba-style SSM with selective scan mechanism.
+    The selective scan is sequential (O(n) in sequence length) and serves
+    as a reference implementation.
+
+    Args:
+        d_model: Model dimension.
+        state_dim: SSM state dimension.
+        dt_rank: Rank for dt projection. Defaults to ``d_model // 16``.
+        expand: Expansion factor for inner dimension.
     """
 
     def __init__(
@@ -27,30 +44,29 @@ class SSMPathway(nn.Module):
         dt_rank: Optional[int] = None,
         expand: int = 2,
     ):
-        """Initialize SSM pathway.
-
-        Args:
-            d_model: Model dimension.
-            state_dim: SSM state dimension.
-            dt_rank: Rank for dt projection. Defaults to d_model // 16.
-            expand: Expansion factor for inner dimension.
-        """
         super().__init__()
         self.d_model = d_model
         self.state_dim = state_dim
-        self.dt_rank = dt_rank or d_model // 16
+        self.dt_rank = dt_rank or max(1, d_model // 16)
         self.d_inner = d_model * expand
 
-        # Input projection
+        # Input projection (x and z gate)
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
 
         # SSM parameters
-        self.A_log = nn.Parameter(torch.log(torch.randn(self.d_inner, state_dim).abs()))
+        # A is initialized as a log-space parameter for numerical stability
+        A = torch.arange(1, self.state_dim + 1, dtype=torch.float32)
+        A = A.unsqueeze(0).expand(self.d_inner, -1).clone()
+        self.A_log = nn.Parameter(torch.log(A))
         self.D = nn.Parameter(torch.ones(self.d_inner))
 
         # Selective parameters
         self.x_proj = nn.Linear(self.d_inner, self.dt_rank + state_dim * 2, bias=False)
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+
+        # Initialize dt bias to a reasonable range
+        dt_init_std = self.dt_rank ** -0.5
+        nn.init.uniform_(self.dt_proj.bias, -dt_init_std, dt_init_std)
 
         # Output projection
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
@@ -75,11 +91,12 @@ class SSMPathway(nn.Module):
         dt, B, C = x_dbl.split([self.dt_rank, self.state_dim, self.state_dim], dim=-1)
         dt = F.softplus(self.dt_proj(dt))
 
-        # SSM computation (simplified selective scan)
-        A = -torch.exp(self.A_log)
-        y = self._selective_scan(x_ssm, dt, A, B, C)
+        # SSM computation (selective scan)
+        A = -torch.exp(self.A_log.float())
+        y = self._selective_scan(x_ssm.float(), dt.float(), A, B.float(), C.float())
+        y = y.to(x.dtype)
 
-        # Skip connection and output
+        # Skip connection and gate
         y = y + x_ssm * self.D
         y = y * torch.sigmoid(z)
         return self.out_proj(y)
@@ -93,6 +110,9 @@ class SSMPathway(nn.Module):
         C: torch.Tensor,
     ) -> torch.Tensor:
         """Perform selective scan operation.
+
+        This is a sequential reference implementation (one step at a time).
+        For production, consider replacing with a parallel scan kernel.
 
         Args:
             x: Input tensor (batch, seq_len, d_inner).
@@ -112,11 +132,17 @@ class SSMPathway(nn.Module):
         outputs = []
 
         for t in range(seq_len):
-            # Update state: h = exp(A * dt) * h + dt * B * x
-            h = torch.exp(A * dt[:, t, :].unsqueeze(-1)) * h + \
-                dt[:, t, :].unsqueeze(-1) * B[:, t, :].unsqueeze(1) * x[:, t, :].unsqueeze(-1)
-            # Output: y = C * h
-            y_t = (h * C[:, t, :].unsqueeze(1)).sum(dim=-1)
+            # Discretized state update:
+            #   h_t = exp(A * dt_t) * h_{t-1} + dt_t * B_t * x_t
+            dt_t = dt[:, t, :].unsqueeze(-1)  # (batch, d_inner, 1)
+            B_t = B[:, t, :].unsqueeze(1)  # (batch, 1, state_dim)
+            x_t = x[:, t, :].unsqueeze(-1)  # (batch, d_inner, 1)
+
+            h = torch.exp(A * dt_t) * h + dt_t * B_t * x_t
+
+            # Output: y_t = sum_j C_{t,j} * h_{t,j}
+            C_t = C[:, t, :].unsqueeze(1)  # (batch, 1, state_dim)
+            y_t = (h * C_t).sum(dim=-1)  # (batch, d_inner)
             outputs.append(y_t)
 
         return torch.stack(outputs, dim=1)
@@ -125,7 +151,15 @@ class SSMPathway(nn.Module):
 class AttentionPathway(nn.Module):
     """Multi-head attention pathway for precise local context modeling.
 
-    Implements standard multi-head self-attention with optional flash attention.
+    Uses ``torch.nn.functional.scaled_dot_product_attention`` which
+    automatically dispatches to FlashAttention / Memory-efficient attention
+    when the hardware and PyTorch version support it.
+
+    Args:
+        d_model: Model dimension.
+        n_heads: Number of attention heads.
+        dropout: Dropout probability.
+        bias: Whether to use bias in linear layers.
     """
 
     def __init__(
@@ -135,14 +169,6 @@ class AttentionPathway(nn.Module):
         dropout: float = 0.0,
         bias: bool = False,
     ):
-        """Initialize attention pathway.
-
-        Args:
-            d_model: Model dimension.
-            n_heads: Number of attention heads.
-            dropout: Dropout probability.
-            bias: Whether to use bias in linear layers.
-        """
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
 
@@ -151,13 +177,9 @@ class AttentionPathway(nn.Module):
         self.head_dim = d_model // n_heads
         self.dropout = dropout
 
-        # QKV projection
-        self.q_proj = nn.Linear(d_model, d_model, bias=bias)
-        self.k_proj = nn.Linear(d_model, d_model, bias=bias)
-        self.v_proj = nn.Linear(d_model, d_model, bias=bias)
+        # Fused QKV projection for efficiency
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=bias)
         self.out_proj = nn.Linear(d_model, d_model, bias=bias)
-
-        self.scale = math.sqrt(self.head_dim)
 
     def forward(
         self,
@@ -168,31 +190,34 @@ class AttentionPathway(nn.Module):
 
         Args:
             x: Input tensor of shape (batch, seq_len, d_model).
-            mask: Optional attention mask.
+            mask: Optional attention mask. Boolean tensor where ``True`` indicates
+                positions that **should** attend to each other. Shape should be
+                broadcastable to ``(batch, n_heads, seq_len, seq_len)``.
 
         Returns:
             Output tensor of shape (batch, seq_len, d_model).
         """
         batch, seq_len, _ = x.shape
 
-        # Project QKV
-        q = self.q_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        # Fused QKV projection
+        qkv = self.qkv_proj(x)  # (batch, seq_len, 3 * d_model)
+        q, k, v = qkv.chunk(3, dim=-1)
 
-        # Scaled dot-product attention
-        attn = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+        # Reshape to (batch, n_heads, seq_len, head_dim)
+        q = q.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        if mask is not None:
-            attn = attn.masked_fill(mask == 0, float("-inf"))
+        # Scaled dot-product attention (auto-dispatches to flash attention)
+        dropout_p = self.dropout if self.training else 0.0
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=mask,
+            dropout_p=dropout_p,
+        )
 
-        attn = F.softmax(attn, dim=-1)
-        attn = F.dropout(attn, p=self.dropout, training=self.training)
-
-        # Apply attention to values
-        out = torch.matmul(attn, v)
+        # Reshape back
         out = out.transpose(1, 2).contiguous().view(batch, seq_len, self.d_model)
-
         return self.out_proj(out)
 
 
@@ -236,7 +261,7 @@ class HybridLayer(nn.Module):
             temperature=temperature,
         )
 
-        # Layer norms
+        # Layer norms (pre-norm style for each pathway)
         self.norm_ssm = nn.LayerNorm(d_model)
         self.norm_attn = nn.LayerNorm(d_model)
         self.norm_out = nn.LayerNorm(d_model)
@@ -260,7 +285,7 @@ class HybridLayer(nn.Module):
         # Get routing decisions
         routing_weights, routing_logits = self.router(x)  # (batch, seq_len, 2)
 
-        # Process through both pathways
+        # Process through both pathways (pre-norm)
         ssm_out = self.norm_ssm(self.ssm_path(x))
         attn_out = self.norm_attn(self.attn_path(x, mask=mask))
 
@@ -274,11 +299,13 @@ class HybridLayer(nn.Module):
         # Collect routing info
         routing_info = None
         if return_routing:
+            with torch.no_grad():
+                ssm_ratio = routing_weights[..., 0].mean().item()
             routing_info = {
                 "routing_weights": routing_weights,
                 "routing_logits": routing_logits,
-                "ssm_ratio": routing_weights[..., 0].mean().item(),
-                "attn_ratio": routing_weights[..., 1].mean().item(),
+                "ssm_ratio": ssm_ratio,
+                "attn_ratio": 1.0 - ssm_ratio,
             }
 
         return output, routing_info
@@ -287,7 +314,8 @@ class HybridLayer(nn.Module):
 class DynaRouteBlock(nn.Module):
     """Complete DynaRoute block with feedforward network.
 
-    Combines HybridLayer with a feedforward network and residual connections.
+    Combines HybridLayer with a feedforward network and residual connections
+    following the pre-norm Transformer architecture.
 
     Args:
         d_model: Model dimension.
@@ -346,7 +374,7 @@ class DynaRouteBlock(nn.Module):
         h, routing_info = self.hybrid(x, mask=mask, return_routing=return_routing)
         h = h + residual
 
-        # FFN with residual
+        # FFN with residual (pre-norm)
         h = h + self.ffn(self.norm(h))
 
         return h, routing_info
