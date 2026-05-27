@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 build/
 dist/
+INNOVATION.md
+TECHNICAL_DISCLOSURE.md
+PROJECT_SUMMARY.md
+papers/
